@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Sparkles">
+<meta name="theme-color" content="#0b1026">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>Sparkles</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #0b1026;
+    overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+  /* Grown-up screen */
+  #gu {
+    position: fixed; inset: 0; z-index: 10; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    touch-action: pan-y; background: rgba(5, 8, 20, 0.94); color: #fff;
+    font: 17px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+  #gu .panel { max-width: 640px; margin: 0 auto; padding: max(28px, env(safe-area-inset-top)) 20px 48px; }
+  #gu h1 { font-size: 26px; margin: 0 0 6px; }
+  #gu p { margin: 6px 0; color: #c9d1f0; }
+  #gu .count { color: #fff; font-weight: 600; margin-top: 14px; }
+  #guStatus { min-height: 1.4em; color: #ffd479; font-weight: 600; }
+  #gu .row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.12); }
+  #gu .emo { font-size: 40px; width: 54px; text-align: center; }
+  #gu .line { flex: 1; font-weight: 600; }
+  #gu .ok { width: 22px; color: #5be37d; font-weight: 800; }
+  #gu button {
+    font: inherit; font-weight: 700; border: 0; border-radius: 12px; padding: 12px 14px;
+    min-width: 86px; color: #fff; background: #2b3a77;
+  }
+  #gu button.rec { background: #c0392b; }
+  #gu button.recording { background: #e67e22; }
+  #gu button:disabled { opacity: 0.35; }
+  #gu #guDone { width: 100%; margin-top: 22px; padding: 16px; background: #3c8d5a; }
+  #gu .small { font-size: 14px; color: #8d96bd; margin-top: 16px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="gu" hidden>
+  <div class="panel">
+    <h1>Grown-up corner</h1>
+    <p>Tap <b>Record</b>, say the line in your happiest voice, then tap <b>Stop</b>. It plays back so you can hear it. Tap <b>Redo</b> to try again.</p>
+    <p>Lines you skip make a fun sound instead. Recordings stay on this iPad.</p>
+    <p class="count" id="guCount"></p>
+    <p id="guStatus"></p>
+    <div id="rows"></div>
+    <button id="guDone">Done</button>
+    <p class="small">To come back here: hold a finger on both top corners of the screen for 2 seconds.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  const BG = '#0b1026';
+  const cv = document.getElementById('c');
+  const cx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  function resize() {
+    const oldW = W, oldH = H;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    cx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    // Keep everything in proportion when the screen size changes (e.g. rotating the iPad).
+    if (oldW > 0 && oldH > 0) {
+      const sx = W / oldW, sy = H / oldH;
+      for (const f of friends) { if (f.x > -9000) { f.x *= sx; f.y *= sy; } f.tx *= sx; f.ty *= sy; if (f.peek) f.peek.along *= f.peek.edge === 'bottom' ? sx : sy; }
+      for (const b of bubbles) { b.x *= sx; b.y *= sy; }
+    }
+    for (const f of friends) f.r = R();
+    for (const b of bubbles) b.r = Math.min(W, H) * b.rf;
+  }
+  window.addEventListener('resize', () => resize());
+
+  // =====================================================================
+  // Sound
+  // =====================================================================
+  let ac = null, master = null, comp = null, voiceBus = null, voices = 0, voiceBusy = false;
+  function audio() {
+    if (!ac) {
+      try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ac = new AC();
+      comp = ac.createDynamicsCompressor();
+      comp.connect(ac.destination);
+      master = ac.createGain(); master.gain.value = 0.35; master.connect(comp);
+      voiceBus = ac.createGain(); voiceBus.gain.value = 1.0; voiceBus.connect(comp);
+      decodeAll();
+    }
+    if (ac.state !== 'running') ac.resume();
+    return ac;
+  }
+  const soundOn = () => ac && ac.state === 'running';
+
+  // Every note comes from a pentatonic scale, so any mashing sounds pleasant.
+  const SCALE = [0, 2, 4, 7, 9];
+  const STEPS = 15;
+  function freqAt(x) {
+    const i = Math.max(0, Math.min(STEPS - 1, Math.floor(x / (W || 1) * STEPS)));
+    return 130.81 * Math.pow(2, (SCALE[i % 5] + 12 * Math.floor(i / 5)) / 12);
+  }
+  function note(f, vol, dur) {
+    if (!soundOn() || voices > 14) return;
+    const t = ac.currentTime;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    const o1 = ac.createOscillator(); o1.type = 'sine'; o1.frequency.value = f;
+    const o2 = ac.createOscillator(); o2.type = 'triangle'; o2.frequency.value = f * 2;
+    const g2 = ac.createGain(); g2.gain.value = 0.22;
+    o1.connect(g); o2.connect(g2); g2.connect(g); g.connect(master);
+    o1.start(t); o2.start(t); o1.stop(t + dur + 0.05); o2.stop(t + dur + 0.05);
+    voices++;
+    o1.onended = () => { voices--; g.disconnect(); };
+  }
+  function sweep(type, f0, f1, f2, dur, vol) {
+    if (!soundOn() || voices > 14) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.3);
+    o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(master);
+    o.start(t); o.stop(t + dur + 0.02);
+    voices++;
+    o.onended = () => { voices--; g.disconnect(); };
+  }
+  const bloop = () => sweep('sine', 320, 700, 1100, 0.28, 0.6);
+  const boing = () => sweep('sine', 160, 520, 110, 0.38, 0.6);
+  const wheeSynth = () => sweep('triangle', 350, 700, 1700, 0.6, 0.45);
+  function chirp(i) {
+    const f = 130.81 * Math.pow(2, (SCALE[i % 5] + 12 * (1 + (i % 2))) / 12);
+    note(f, 0.4, 0.5);
+    setTimeout(() => note(f * 1.5, 0.35, 0.7), 110);
+  }
+  function tada() {
+    [0, 4, 7, 12].forEach((s, j) => setTimeout(() => note(261.63 * Math.pow(2, s / 12), 0.35, 0.8), j * 90));
+  }
+
+  // =====================================================================
+  // Recorded voice lines (stored on the iPad in IndexedDB)
+  // =====================================================================
+  const ANIMALS = [
+    { k: 'mouse', e: '\u{1F42D}', line: 'Squeak squeak! Mousey!', hue: 320 },
+    { k: 'dog',   e: '\u{1F436}', line: 'Woof woof! Doggy!',  hue: 30 },
+    { k: 'cat',   e: '\u{1F431}', line: 'Meow! Kitty!',       hue: 45 },
+    { k: 'cow',   e: '\u{1F42E}', line: 'Moo! Cow!',          hue: 200 },
+    { k: 'pig',   e: '\u{1F437}', line: 'Oink oink! Piggy!',  hue: 335 },
+    { k: 'duck',  e: '\u{1F986}', line: 'Quack quack! Duck!', hue: 55 },
+    { k: 'frog',  e: '\u{1F438}', line: 'Ribbit! Froggy!',    hue: 120 },
+    { k: 'lion',  e: '\u{1F981}', line: 'Roar! Lion!',        hue: 25 },
+    { k: 'sheep', e: '\u{1F411}', line: 'Baa! Sheep!',        hue: 265 },
+  ];
+  const EXTRAS = [
+    { k: 'whee',     e: '\u{1F4A8}', line: 'Wheee! (when she flings an animal)' },
+    { k: 'peekaboo', e: '\u{1F648}', line: 'Peekaboo! (when an animal pops out)' },
+  ];
+  const LINES = ANIMALS.concat(EXTRAS);
+
+  const raw = new Map();    // key -> { type, data: ArrayBuffer }
+  const clips = new Map();  // key -> { buf, start, end }
+
+  function dbOpen() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('sparkles', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('clips');
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+  async function dbAll() {
+    const db = await dbOpen();
+    return new Promise((res, rej) => {
+      const out = new Map();
+      const req = db.transaction('clips', 'readonly').objectStore('clips').openCursor();
+      req.onsuccess = () => { const c = req.result; if (c) { out.set(c.key, c.value); c.continue(); } else res(out); };
+      req.onerror = () => rej(req.error);
+    });
+  }
+  async function dbPut(k, v) {
+    const db = await dbOpen();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('clips', 'readwrite');
+      tx.objectStore('clips').put(v, k);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+  dbAll().then(m => { m.forEach((v, k) => raw.set(k, v)); decodeAll(); refreshRows(); }).catch(() => {});
+
+  // Cut the silence before and after the words so taps feel instant.
+  function trim(buf) {
+    const d = buf.getChannelData(0), sr = buf.sampleRate;
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; }
+    const th = Math.max(0.01, peak * 0.08);
+    let s = 0, e = d.length - 1;
+    while (s < d.length && Math.abs(d[s]) < th) s++;
+    while (e > s && Math.abs(d[e]) < th) e--;
+    if (s >= e) return { buf, start: 0, end: buf.duration };
+    return { buf, start: Math.max(0, s / sr - 0.04), end: Math.min(buf.duration, e / sr + 0.15) };
+  }
+  function decodeClip(k) {
+    const v = raw.get(k);
+    if (!v || !ac) return Promise.resolve();
+    return new Promise(res => {
+      try {
+        const p = ac.decodeAudioData(v.data.slice(0), buf => { clips.set(k, trim(buf)); res(); }, () => res());
+        if (p && p.catch) p.catch(() => res());
+      } catch (e) { res(); }
+    });
+  }
+  function decodeAll() { raw.forEach((v, k) => { if (!clips.has(k)) decodeClip(k); }); }
+
+  function playClip(k, force) {
+    const c = clips.get(k);
+    if (!c || !soundOn()) return false;
+    if (voiceBusy && !force) return false;
+    const src = ac.createBufferSource();
+    src.buffer = c.buf;
+    src.connect(voiceBus);
+    src.start(0, c.start, Math.max(0.05, c.end - c.start));
+    voiceBusy = true;
+    src.onended = () => { voiceBusy = false; src.disconnect(); };
+    return true;
+  }
+
+  // =====================================================================
+  // Keep the screen awake
+  // =====================================================================
+  let lock = null;
+  async function wake() {
+    try {
+      if ('wakeLock' in navigator && !lock) {
+        lock = await navigator.wakeLock.request('screen');
+        lock.addEventListener('release', () => { lock = null; });
+      }
+    } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { wake(); if (ac) ac.resume(); }
+  });
+
+  // =====================================================================
+  // Sparkles, rings, bubbles
+  // =====================================================================
+  const parts = [], rings = [], bubbles = [];
+  const MAX_PARTS = 900;
+  let hueBase = Math.random() * 360;
+
+  function burst(x, y, hue, n, speed) {
+    for (let i = 0; i < n; i++) {
+      if (parts.length > MAX_PARTS) parts.shift();
+      const a = Math.random() * Math.PI * 2;
+      const s = speed * (0.35 + Math.random() * 0.65);
+      parts.push({
+        x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1,
+        life: 0, max: 50 + Math.random() * 40, size: 7 + Math.random() * 12,
+        hue: (hue + Math.random() * 60 - 30 + 360) % 360,
+        shape: Math.random() < 0.55 ? 0 : (Math.random() < 0.6 ? 1 : 2),
+        rot: Math.random() * 6.28, vr: (Math.random() - 0.5) * 0.2, grav: 0.06, drag: 0.965
+      });
+    }
+  }
+  function trailDot(x, y, hue) {
+    if (parts.length > MAX_PARTS) parts.shift();
+    parts.push({
+      x: x + (Math.random() - 0.5) * 6, y: y + (Math.random() - 0.5) * 6,
+      vx: (Math.random() - 0.5) * 0.6, vy: (Math.random() - 0.5) * 0.6 - 0.3,
+      life: 0, max: 45 + Math.random() * 20, size: 12 + Math.random() * 8,
+      hue, shape: Math.random() < 0.85 ? 0 : 1, rot: Math.random() * 6.28, vr: 0.05, grav: 0, drag: 0.98
+    });
+  }
+  function newBubble(fromBottom) {
+    const rf = 0.06 + Math.random() * 0.05;
+    const r = Math.min(W, H) * rf;
+    return {
+      rf, x: r + Math.random() * (W - 2 * r),
+      y: fromBottom ? H + r + Math.random() * r * 2 : r + Math.random() * (H - 2 * r),
+      r, vy: -(0.35 + Math.random() * 0.45), hue: Math.random() * 360, wob: Math.random() * 6.28, born: 0
+    };
+  }
+  function popAt(x, y) {
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i];
+      const dx = x - b.x, dy = y - b.y;
+      if (dx * dx + dy * dy < (b.r * 1.15) * (b.r * 1.15)) {
+        bubbles.splice(i, 1);
+        burst(b.x, b.y, b.hue, 40, 9);
+        rings.push({ x: b.x, y: b.y, r: b.r, hue: b.hue, life: 0 });
+        bloop();
+        setTimeout(() => note(freqAt(b.x) * 2, 0.3, 0.9), 90);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // =====================================================================
+  // Animal friends
+  // =====================================================================
+  const friends = [];
+  const MAX_FRIENDS = 4;
+  let seeded = false, nextSpawn = 0, nextPeek = 0, nextNudge = 0;
+  const R = () => Math.min(W, H) * 0.12;
+
+  const emojiCache = {};
+  function emojiImg(e) {
+    if (emojiCache[e]) return emojiCache[e];
+    const c = document.createElement('canvas');
+    c.width = c.height = 256;
+    const g = c.getContext('2d');
+    g.font = '196px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(e, 128, 140);
+    return (emojiCache[e] = c);
+  }
+
+  function pickAnimal() {
+    const used = new Set(friends.map(f => f.def.k));
+    // If the mouse has left the screen, bring it back first.
+    if (!used.has('mouse')) return ANIMALS[0];
+    const free = ANIMALS.filter(a => !used.has(a.k));
+    const pool = free.length ? free : ANIMALS;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  function roamVel(f) {
+    const a = Math.random() * 6.28, s = 0.25 + Math.random() * 0.3;
+    f.vx = Math.cos(a) * s; f.vy = Math.sin(a) * s;
+  }
+  function makeFriend(def, x, y, mode) {
+    const f = { def, x, y, r: R(), vx: 0, vy: 0, mode, rot: 0, bt: 99, bAmp: 0,
+      born: mode === 'roam' ? 0 : 1, ph: Math.random() * 6.28, lastBump: 0, tx: x, ty: y, peek: null, heldBy: null };
+    roamVel(f);
+    return f;
+  }
+  function bounce(f, amp) { f.bt = 0; f.bAmp = amp || 1; }
+  const regularCount = () => friends.filter(f => f.mode !== 'flying' && f.mode !== 'peek').length;
+
+  function seed() {
+    const r = R();
+    for (let i = 0; i < MAX_FRIENDS; i++) {
+      let x = 0, y = 0;
+      for (let t = 0; t < 40; t++) {
+        x = r * 1.3 + Math.random() * (W - 2.6 * r);
+        y = r * 1.3 + Math.random() * (H - 2.6 * r);
+        if (friends.every(f => Math.hypot(f.x - x, f.y - y) > r * 2.4)) break;
+      }
+      // Her favorite, the mouse, is always in the starting group.
+      friends.push(makeFriend(i === 0 ? ANIMALS[0] : pickAnimal(), x, y, 'roam'));
+    }
+  }
+  function spawnEntering() {
+    const def = pickAnimal(), r = R();
+    const tx = r * 1.3 + Math.random() * (W - 2.6 * r);
+    const ty = r * 1.3 + Math.random() * (H - 2.6 * r);
+    const edge = Math.floor(Math.random() * 3);
+    const x = edge === 0 ? -r * 1.5 : edge === 1 ? W + r * 1.5 : tx;
+    const y = edge === 2 ? H + r * 1.5 : ty;
+    const f = makeFriend(def, x, y, 'enter');
+    f.tx = tx; f.ty = ty;
+    friends.push(f);
+  }
+
+  // Peekaboo: an animal peeks in from an edge, hides, peeks again, then pops out.
+  function startPeek() {
+    const def = pickAnimal(), r = R();
+    const edge = ['left', 'right', 'bottom'][Math.floor(Math.random() * 3)];
+    const along = edge === 'bottom' ? r * 1.6 + Math.random() * (W - 3.2 * r) : r * 1.6 + Math.random() * (H - 3.2 * r);
+    const f = makeFriend(def, -9999, -9999, 'peek');
+    f.peek = { edge, along, phase: 'wait', t: 0, count: 0 };
+    friends.push(f);
+  }
+  function peekPos(f, depth) {
+    const r = f.r, p = f.peek;
+    if (p.edge === 'left')       { f.x = -r + depth;    f.y = p.along;     f.rot = 0.35; }
+    else if (p.edge === 'right') { f.x = W + r - depth; f.y = p.along;     f.rot = -0.35; }
+    else                         { f.x = p.along;       f.y = H + r - depth; f.rot = 0; }
+  }
+  function popOut(f) {
+    const r = f.r, p = f.peek;
+    if (p.edge === 'left')       { f.tx = r * 1.6;     f.ty = p.along; }
+    else if (p.edge === 'right') { f.tx = W - r * 1.6; f.ty = p.along; }
+    else                         { f.tx = p.along;     f.ty = H - r * 1.6; }
+    f.mode = 'enter'; f.peek = null;
+    bounce(f, 1.3);
+    burst(f.tx, f.ty, f.def.hue, 36, 8);
+    rings.push({ x: f.tx, y: f.ty, r: r, hue: f.def.hue, life: 0 });
+    if (!playClip('peekaboo', true)) tada();
+    nextPeek = performance.now() + 20000 + Math.random() * 15000;
+  }
+  const ease = t => t <= 0 ? 0 : t >= 1 ? 1 : (1 - Math.cos(t * Math.PI)) / 2;
+
+  function updateFriends(dt, dtMs, now) {
+    for (let i = friends.length - 1; i >= 0; i--) {
+      const f = friends[i];
+      f.bt += dt;
+      f.bAmp *= Math.pow(0.93, dt);
+      f.born = Math.min(1, f.born + 0.04 * dt);
+      f.ph += 0.03 * dt;
+
+      if (f.mode === 'roam') {
+        f.x += f.vx * dt; f.y += f.vy * dt;
+        const m = f.r * 1.05;
+        if (f.x < m) { f.x = m; f.vx = Math.abs(f.vx); }
+        if (f.x > W - m) { f.x = W - m; f.vx = -Math.abs(f.vx); }
+        if (f.y < m) { f.y = m; f.vy = Math.abs(f.vy); }
+        if (f.y > H - m) { f.y = H - m; f.vy = -Math.abs(f.vy); }
+        f.rot = Math.sin(f.ph) * 0.08;
+      } else if (f.mode === 'enter') {
+        const k = Math.min(1, 0.08 * dt);
+        f.x += (f.tx - f.x) * k; f.y += (f.ty - f.y) * k;
+        f.rot *= 0.9;
+        if (Math.hypot(f.tx - f.x, f.ty - f.y) < 2) { f.mode = 'roam'; roamVel(f); }
+      } else if (f.mode === 'held') {
+        f.rot = Math.sin(now / 70) * 0.22;
+      } else if (f.mode === 'flying') {
+        f.x += f.vx * dt; f.y += f.vy * dt; f.rot += 0.25 * dt;
+        const m = f.r * 2;
+        if (f.x < -m || f.x > W + m || f.y < -m || f.y > H + m) { friends.splice(i, 1); continue; }
+      } else if (f.mode === 'peek') {
+        const p = f.peek, D = f.r * 1.15;
+        p.t += dtMs;
+        if (p.phase === 'wait') { peekPos(f, 0); if (p.t > 900) { p.phase = 'in'; p.t = 0; } }
+        else if (p.phase === 'in') { peekPos(f, D * ease(p.t / 400)); if (p.t > 400) { p.phase = 'hold'; p.t = 0; } }
+        else if (p.phase === 'hold') { peekPos(f, D); f.rot += Math.sin(now / 120) * 0.08; if (p.t > 1200) { p.phase = 'out'; p.t = 0; } }
+        else if (p.phase === 'out') {
+          peekPos(f, D * (1 - ease(p.t / 400)));
+          if (p.t > 400) { p.count++; p.t = 0; if (p.count >= 2) popOut(f); else p.phase = 'wait'; }
+        }
+      }
+    }
+    // Gently push roaming animals apart so they don't stack.
+    for (let i = 0; i < friends.length; i++) for (let j = i + 1; j < friends.length; j++) {
+      const a = friends[i], b = friends[j];
+      if (a.mode !== 'roam' || b.mode !== 'roam') continue;
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1, min = a.r + b.r;
+      if (d < min) {
+        const push = (min - d) / 2, nx = dx / d, ny = dy / d;
+        a.x -= nx * push; a.y -= ny * push; b.x += nx * push; b.y += ny * push;
+        a.vx -= nx * 0.05; a.vy -= ny * 0.05; b.vx += nx * 0.05; b.vy += ny * 0.05;
+      }
+    }
+  }
+
+  function drawFriend(f) {
+    const s = 0.28 * f.bAmp * Math.sin(f.bt * 0.5);
+    const hop = -Math.abs(Math.sin(f.bt * 0.25)) * f.r * 0.35 * f.bAmp;
+    const r = f.r * f.born;
+    cx.save();
+    cx.translate(f.x, f.y + hop);
+    cx.rotate(f.rot);
+    cx.scale(1 + s, 1 - s);
+    const g = cx.createRadialGradient(0, 0, r * 0.2, 0, 0, r);
+    g.addColorStop(0, `hsla(${f.def.hue},90%,75%,0.55)`);
+    g.addColorStop(1, `hsla(${f.def.hue},90%,60%,0.18)`);
+    cx.fillStyle = g;
+    cx.beginPath(); cx.arc(0, 0, r, 0, 6.283); cx.fill();
+    cx.strokeStyle = `hsla(${f.def.hue},100%,80%,0.6)`;
+    cx.lineWidth = 3; cx.stroke();
+    cx.drawImage(emojiImg(f.def.e), -r * 0.82, -r * 0.82, r * 1.64, r * 1.64);
+    cx.restore();
+  }
+
+  function friendAt(x, y) {
+    for (let i = friends.length - 1; i >= 0; i--) {
+      const f = friends[i];
+      if (f.mode === 'flying' || f.heldBy !== null) continue;
+      const dx = x - f.x, dy = y - f.y;
+      if (dx * dx + dy * dy < (f.r * 1.1) * (f.r * 1.1)) return f;
+    }
+    return null;
+  }
+
+  // =====================================================================
+  // Touch
+  // =====================================================================
+  const ptrs = new Map();
+  let lastTouch = performance.now();
+  let guOpen = false;
+  const CORNER = 90;
+
+  cv.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (guOpen) return;
+    audio(); wake();
+    const now = performance.now();
+    lastTouch = now;
+    const x = e.clientX, y = e.clientY;
+    hueBase = (hueBase + 47) % 360;
+    const p = {
+      x, y, hue: hueBase, dist: 0, moved: 0, t0: now, hist: [{ x, y, t: now }], f: null, offX: 0, offY: 0,
+      corner: y < CORNER ? (x < CORNER ? 'L' : x > W - CORNER ? 'R' : null) : null
+    };
+    ptrs.set(e.pointerId, p);
+
+    const f = friendAt(x, y);
+    if (f && f.mode === 'peek') {
+      if (f.peek.phase === 'in' || f.peek.phase === 'hold') { popOut(f); return; }
+    } else if (f) {
+      // Tap: the animal bounces and says its line. Holding on lets her drag it.
+      f.mode = 'held'; f.heldBy = e.pointerId;
+      p.f = f; p.offX = x - f.x; p.offY = y - f.y;
+      friends.splice(friends.indexOf(f), 1); friends.push(f);
+      bounce(f, 1);
+      burst(x, y, f.def.hue, 16, 5);
+      if (!playClip(f.def.k)) chirp(ANIMALS.indexOf(f.def));
+      return;
+    }
+    if (!popAt(x, y)) {
+      burst(x, y, hueBase, 26, 7);
+      rings.push({ x, y, r: 10, hue: hueBase, life: 0 });
+      note(freqAt(x), 0.45, 1.4);
+    }
+  });
+
+  cv.addEventListener('pointermove', e => {
+    const p = ptrs.get(e.pointerId);
+    if (!p) return;
+    e.preventDefault();
+    const now = performance.now();
+    lastTouch = now;
+    const evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+    for (const ev of evs) {
+      const x = ev.clientX, y = ev.clientY;
+      const dx = x - p.x, dy = y - p.y, d = Math.hypot(dx, dy);
+      p.moved += d;
+      p.hist.push({ x, y, t: now });
+      while (p.hist.length > 2 && now - p.hist[0].t > 150) p.hist.shift();
+      if (p.corner && (y > CORNER + 30 || (p.corner === 'L' ? x > CORNER + 30 : x < W - CORNER - 30))) p.corner = null;
+
+      if (p.f) {
+        const f = p.f;
+        f.x = Math.max(-f.r * 0.3, Math.min(W + f.r * 0.3, x - p.offX));
+        f.y = Math.max(-f.r * 0.3, Math.min(H + f.r * 0.3, y - p.offY));
+        if (d > 3) trailDot(f.x, f.y, f.def.hue);
+      } else {
+        const steps = Math.max(1, Math.floor(d / 7));
+        for (let s = 1; s <= steps; s++) trailDot(p.x + dx * s / steps, p.y + dy * s / steps, p.hue);
+        p.hue = (p.hue + d * 0.35) % 360;
+        p.dist += d;
+        if (p.dist > 75) { p.dist = 0; note(freqAt(x), 0.16, 0.6); }
+        popAt(x, y);
+        const g = friendAt(x, y);
+        if (g && g.mode === 'roam' && now - g.lastBump > 900) { g.lastBump = now; bounce(g, 0.7); }
+      }
+      p.x = x; p.y = y;
+    }
+  });
+
+  function release(e) {
+    const p = ptrs.get(e.pointerId);
+    if (!p) return;
+    ptrs.delete(e.pointerId);
+    const f = p.f;
+    if (!f) return;
+    f.heldBy = null;
+    const now = performance.now();
+    const h = p.hist, last = h[h.length - 1];
+    let first = h[0];
+    for (const q of h) { if (last.t - q.t <= 100) { first = q; break; } }
+    const span = Math.max(16, last.t - first.t);
+    let vx = (last.x - first.x) / span, vy = (last.y - first.y) / span;
+    if (now - last.t > 90) { vx = 0; vy = 0; }
+    const speed = Math.hypot(vx, vy);
+    if (p.moved > 50 && speed > 0.7) {
+      // Swipe: the animal flies away and a new friend comes in.
+      const k = Math.max(20, 14 / speed);
+      f.mode = 'flying'; f.vx = vx * k; f.vy = vy * k;
+      burst(f.x, f.y, f.def.hue, 22, 6);
+      if (!playClip('whee', true)) wheeSynth();
+      nextSpawn = now + 700;
+    } else {
+      f.mode = 'roam'; roamVel(f);
+      if (p.moved > 25) { bounce(f, 1); boing(); burst(f.x, f.y + f.r * 0.6, f.def.hue, 12, 4); }
+    }
+  }
+  cv.addEventListener('pointerup', release);
+  cv.addEventListener('pointercancel', release);
+  cv.addEventListener('pointerleave', release);
+
+  // Block zoom, scroll, text selection, long-press menus and double-tap zoom
+  // everywhere except the grown-up screen.
+  ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'gestureend', 'dblclick', 'contextmenu', 'selectstart']
+    .forEach(ev => document.addEventListener(ev, e => {
+      if (guOpen && e.target && e.target.closest && e.target.closest('#gu')) return;
+      if (ev === 'touchstart' || ev === 'touchend') audio();
+      e.preventDefault();
+    }, { passive: false }));
+
+  // =====================================================================
+  // Grown-up screen: record the voice lines
+  // =====================================================================
+  const gu = document.getElementById('gu');
+  const rowsEl = document.getElementById('rows');
+  const statusEl = document.getElementById('guStatus');
+  const countEl = document.getElementById('guCount');
+  const rowEls = {};
+  let rec = null, recKey = null, recStream = null, recTimer = 0;
+
+  LINES.forEach(L => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span class="emo">${L.e}</span><span class="line"></span><span class="ok"></span>` +
+      `<button class="rec"></button><button class="play">Play</button>`;
+    row.querySelector('.line').textContent = L.line;
+    row.querySelector('.rec').addEventListener('click', () => toggleRec(L.k));
+    row.querySelector('.play').addEventListener('click', async () => {
+      audio();
+      if (!clips.has(L.k)) await decodeClip(L.k);
+      playClip(L.k, true);
+    });
+    rowsEl.appendChild(row);
+    rowEls[L.k] = row;
+  });
+
+  function refreshRows() {
+    let n = 0;
+    LINES.forEach(L => {
+      const row = rowEls[L.k], has = raw.has(L.k), b = row.querySelector('.rec');
+      if (has) n++;
+      b.textContent = recKey === L.k ? 'Stop' : has ? 'Redo' : 'Record';
+      b.className = recKey === L.k ? 'rec recording' : 'rec';
+      b.disabled = !!rec && recKey !== L.k;
+      row.querySelector('.play').disabled = !has || !!rec;
+      row.querySelector('.ok').textContent = has ? '✓' : '';
+    });
+    countEl.textContent = `${n} of ${LINES.length} lines recorded`;
+  }
+  const setStatus = s => { statusEl.textContent = s; };
+  function backToPlayback() { try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {} }
+
+  async function toggleRec(k) {
+    if (rec) { stopRec(); return; }
+    setStatus('');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+      setStatus('Recording only works once Sparkles is opened from its secure web address. It will work after it goes online.');
+      return;
+    }
+    try {
+      try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+      recStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
+    } catch (e) {
+      backToPlayback();
+      setStatus('The microphone is blocked. Tap Allow when the iPad asks, or turn it on in the iPad Settings.');
+      return;
+    }
+    const types = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
+    const type = types.find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+    const chunks = [];
+    rec = new MediaRecorder(recStream, type ? { mimeType: type } : undefined);
+    recKey = k;
+    rec.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    rec.onstop = async () => {
+      const key = recKey, mt = rec.mimeType || type || 'audio/mp4';
+      recStream.getTracks().forEach(t => t.stop());
+      rec = null; recKey = null;
+      backToPlayback();
+      refreshRows();
+      const blob = new Blob(chunks, { type: mt });
+      if (!blob.size) { setStatus('Nothing was recorded. Try again.'); return; }
+      const v = { type: mt, data: await blob.arrayBuffer() };
+      raw.set(key, v); clips.delete(key);
+      try { await dbPut(key, v); } catch (e) { setStatus('That one did not save. Try again.'); }
+      refreshRows();
+      audio();
+      await decodeClip(key);
+      playClip(key, true);
+    };
+    rec.start();
+    refreshRows();
+    recTimer = setTimeout(stopRec, 6000);
+  }
+  function stopRec() { clearTimeout(recTimer); if (rec && rec.state !== 'inactive') rec.stop(); }
+
+  function openGU() {
+    guOpen = true;
+    for (const [id, p] of ptrs) if (p.f) { p.f.heldBy = null; p.f.mode = 'roam'; }
+    ptrs.clear();
+    setStatus('');
+    refreshRows();
+    gu.hidden = false;
+    gu.scrollTop = 0;
+  }
+  document.getElementById('guDone').addEventListener('click', () => {
+    stopRec();
+    gu.hidden = true;
+    setTimeout(() => { guOpen = false; }, 50);
+  });
+  refreshRows();
+
+  // =====================================================================
+  // Drawing
+  // =====================================================================
+  function star(x, y, r, rot) {
+    cx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rr = i % 2 ? r * 0.45 : r, a = rot + i * Math.PI / 5;
+      cx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+    }
+    cx.closePath(); cx.fill();
+  }
+  function heart(x, y, r, rot) {
+    cx.save(); cx.translate(x, y); cx.rotate(rot * 0.3); cx.scale(r / 16, r / 16);
+    cx.beginPath();
+    cx.moveTo(0, 6);
+    cx.bezierCurveTo(-16, -6, -8, -18, 0, -9);
+    cx.bezierCurveTo(8, -18, 16, -6, 0, 6);
+    cx.fill(); cx.restore();
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dtMs = Math.min(50, now - last);
+    const dt = dtMs / 16.67;
+    last = now;
+    if (window.innerWidth !== W || window.innerHeight !== H) resize();
+
+    const ready = W >= 50 && H >= 50;
+    if (ready && !seeded) {
+      seeded = true;
+      seed();
+      for (let i = 0; i < 5; i++) bubbles.push(newBubble(false));
+      nextPeek = now + 12000;
+    }
+    const idle = now - lastTouch > 5000;
+    if (ready) {
+      if (regularCount() < MAX_FRIENDS && now > nextSpawn) { spawnEntering(); nextSpawn = now + 400; }
+      if (now > nextPeek && !friends.some(f => f.mode === 'peek')) startPeek();
+      while (bubbles.length < 6) bubbles.push(newBubble(true));
+      // If she stops for a bit, the animals hop to invite another tap.
+      if (idle && now > nextNudge) {
+        const roamers = friends.filter(f => f.mode === 'roam');
+        if (roamers.length) bounce(roamers[Math.floor(Math.random() * roamers.length)], 0.6);
+        nextNudge = now + 2500;
+      }
+    }
+
+    // Grown-up screen: both top corners held for 2 seconds.
+    if (!guOpen) {
+      let L = null, Rr = null;
+      for (const p of ptrs.values()) { if (p.corner === 'L') L = p; if (p.corner === 'R') Rr = p; }
+      if (L && Rr && now - L.t0 > 2000 && now - Rr.t0 > 2000) openGU();
+    }
+
+    updateFriends(dt, dtMs, now);
+
+    cx.globalCompositeOperation = 'source-over';
+    cx.fillStyle = BG;
+    cx.fillRect(0, 0, W, H);
+
+    // Bubbles
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i];
+      b.born = Math.min(1, b.born + 0.02 * dt);
+      b.wob += 0.03 * dt;
+      b.y += b.vy * dt * (idle ? 1.6 : 1);
+      b.x += Math.sin(b.wob) * 0.4 * dt;
+      if (b.y < -b.r * 1.5) { bubbles.splice(i, 1); continue; }
+      const r = b.r * (1 + Math.sin(now / 300 + b.wob) * 0.03) * b.born;
+      const g = cx.createRadialGradient(b.x - r * 0.35, b.y - r * 0.35, r * 0.1, b.x, b.y, r);
+      g.addColorStop(0, `hsla(${b.hue},100%,92%,0.85)`);
+      g.addColorStop(0.55, `hsla(${b.hue},95%,65%,0.45)`);
+      g.addColorStop(1, `hsla(${b.hue},95%,60%,0.15)`);
+      cx.fillStyle = g;
+      cx.beginPath(); cx.arc(b.x, b.y, r, 0, 6.283); cx.fill();
+      cx.strokeStyle = `hsla(${b.hue},100%,85%,0.7)`;
+      cx.lineWidth = 2; cx.stroke();
+      cx.fillStyle = 'rgba(255,255,255,0.75)';
+      cx.beginPath(); cx.ellipse(b.x - r * 0.4, b.y - r * 0.45, r * 0.18, r * 0.11, -0.6, 0, 6.283); cx.fill();
+    }
+
+    // Animals
+    for (const f of friends) if (f.x > -9000) drawFriend(f);
+
+    cx.globalCompositeOperation = 'lighter';
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const g = rings[i];
+      g.life += dt; g.r += 5 * dt;
+      const a = 1 - g.life / 40;
+      if (a <= 0) { rings.splice(i, 1); continue; }
+      cx.strokeStyle = `hsla(${g.hue},100%,65%,${a})`;
+      cx.lineWidth = 6 * a + 1;
+      cx.beginPath(); cx.arc(g.x, g.y, g.r, 0, 6.283); cx.stroke();
+    }
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i];
+      p.life += dt;
+      if (p.life >= p.max) { parts.splice(i, 1); continue; }
+      p.vx *= Math.pow(p.drag, dt); p.vy = p.vy * Math.pow(p.drag, dt) + p.grav * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+      const k = 1 - p.life / p.max, r = p.size * (0.4 + 0.6 * k);
+      cx.fillStyle = `hsla(${p.hue},100%,62%,${k})`;
+      if (p.shape === 1) star(p.x, p.y, r, p.rot);
+      else if (p.shape === 2) heart(p.x, p.y, r, p.rot);
+      else { cx.beginPath(); cx.arc(p.x, p.y, r * 0.7, 0, 6.283); cx.fill(); }
+    }
+
+    requestAnimationFrame(frame);
+  }
+  resize();
+  requestAnimationFrame(frame);
+
+  // For testing from a computer.
+  window.__sparkles = { friends, bubbles, raw, clips, playClip, startPeek, openGU, dbPut, ptrs };
+
+  // Works offline once installed (only over https).
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+})();
+</script>
+</body>
+</html>
